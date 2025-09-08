@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""
+DLNA Streamer Graphical User Interface
+
+A professional GUI application for DLNA media streaming with advanced features
+including subtitle support, format optimization, and real-time playback controls.
+
+Features:
+- Device discovery and management
+- File management with drag-and-drop support
+- Real-time playback controls (play, pause, seek, stop)
+- Volume and mute control with TV synchronization
+- Subtitle support (external files and embedded tracks)
+- Streaming optimization analysis
+- Professional user interface with full-screen support
+
+Usage:
+    dlna_gui
+
+The GUI will automatically discover available DLNA devices and provide
+an intuitive interface for media streaming with comprehensive controls.
+"""
+
+import os
+import sys
+
+# Add the parent directory to the Python path for imports
+CURRENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if CURRENT_DIR not in sys.path:
+    sys.path.insert(0, CURRENT_DIR)
+
+from dlna_streamer.gui import launch
+
+if __name__ == "__main__":
+    launch()

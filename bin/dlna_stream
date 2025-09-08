@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""
+DLNA Streamer Command Line Interface
+
+A professional CLI tool for discovering DLNA MediaRenderer devices and streaming
+local media files with optimized performance and full playback control.
+
+Features:
+- Intelligent device discovery with deduplication
+- Optimized HTTP streaming with Range request support
+- Full AVTransport integration (play, pause, seek, stop)
+- Format analysis and optimization recommendations
+- Professional error handling and user feedback
+
+Usage:
+    dlna_stream discover [--timeout SECONDS] [--verbose]
+    dlna_stream play FILE [--device-index N] [--timeout SECONDS] [--port N] [--verbose]
+
+Examples:
+    # Discover available devices
+    dlna_stream discover --timeout 5
+
+    # Stream a video file
+    dlna_stream play "/path/to/video.mp4"
+
+    # Stream with specific device and port
+    dlna_stream play "/path/to/video.mp4" --device-index 0 --port 8080
+"""
+
+import argparse
+import os
+import socket
+import sys
+import threading
+import time
+from urllib.parse import quote
+
+# Adjust path for imports when running from source tree
+CURRENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if CURRENT_DIR not in sys.path:
+    sys.path.insert(0, CURRENT_DIR)
+
+from dlna_streamer.avtransport import DLNAController
+from dlna_streamer.device import fetch_description
+from dlna_streamer.http_server import serve_directory
+from dlna_streamer.ssdp import discover
+
+
+def get_local_ip() -> str:
+    """Return primary local IPv4 address used for outbound connections."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+
+def _root_uuid(usn: str) -> str:
+    """Extract the root uuid: prefix from a USN value."""
+    return usn.split("::", 1)[0] if usn else usn
+
+
+def _entry_rank(st: str) -> int:
+    """Rank entries: prefer AVTransport, then MediaRenderer, then rootdevice, then others."""
+    if "urn:schemas-upnp-org:service:AVTransport:1" in st:
+        return 0
+    if "urn:schemas-upnp-org:device:MediaRenderer:1" in st:
+        return 1
+    if st == "upnp:rootdevice":
+        return 2
+    return 3
+
+
+def get_avtransport_candidates(timeout: float):
+    """Return unique list of (device, description) that expose AVTransport, best entry per device."""
+    devices = discover(timeout=timeout)
+    best_by_uuid = {}
+    for dev in devices:
+        desc = fetch_description(dev.location)
+        if not desc.avtransport_control_url:
+            continue
+        uuid = _root_uuid(dev.usn)
+        rank = _entry_rank(dev.st)
+        current = best_by_uuid.get(uuid)
+        if current is None or rank < current[2]:
+            best_by_uuid[uuid] = (dev, desc, rank)
+    return [(dev, desc) for (dev, desc, _) in best_by_uuid.values()]
+
+
+def cmd_discover(args):
+    """Discover and list unique DLNA MediaRenderers exposing AVTransport."""
+    print("🔍 Discovering DLNA devices...")
+    candidates = get_avtransport_candidates(args.timeout)
+    if not candidates:
+        print("❌ No MediaRenderer with AVTransport found. Try increasing timeout or checking network.")
+        return 0
+    print(f"✅ Found {len(candidates)} device(s):")
+    for idx, (dev, desc) in enumerate(candidates):
+        print(f"  [{idx}] {desc.friendly_name}")
+        if getattr(args, "verbose", False):
+            print(f"     ST={dev.st} USN={dev.usn}")
+            print(f"     desc: {dev.location}")
+            print(f"     AVTransport: {desc.avtransport_control_url}")
+
+
+def cmd_play(args):
+    """Serve the given file and start playback on the selected device."""
+    print("🔍 Discovering DLNA devices...")
+    candidates = get_avtransport_candidates(args.timeout)
+    if not candidates:
+        print("❌ No playable DLNA renderers found.")
+        return 1
+
+    if args.device_index is not None:
+        try:
+            dev, desc = candidates[args.device_index]
+            print(f"📺 Selected device: {desc.friendly_name}")
+        except Exception:
+            print("❌ Invalid device index")
+            return 1
+    else:
+        print(f"✅ Found {len(candidates)} device(s):")
+        for idx, (dev, desc) in enumerate(candidates):
+            print(f"  [{idx}] {desc.friendly_name}")
+        sel = input("Select device index: ")
+        try:
+            dev, desc = candidates[int(sel)]
+            print(f"📺 Selected device: {desc.friendly_name}")
+        except Exception:
+            print("❌ Invalid selection")
+            return 1
+
+    media_path = os.path.abspath(args.file)
+    if not os.path.isfile(media_path):
+        print(f"❌ File not found: {media_path}")
+        return 1
+
+    serve_dir = os.path.dirname(media_path)
+    file_name = os.path.basename(media_path)
+    print(f"🎬 File: {file_name}")
+
+    # Use auto port (0) by default to avoid address-in-use
+    port_to_use = args.port
+    if port_to_use == -1:
+        port_to_use = 0
+
+    try:
+        httpd, port = serve_directory(serve_dir, port=port_to_use)
+    except OSError:
+        # Retry with ephemeral port
+        httpd, port = serve_directory(serve_dir, port=0)
+
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    print(f"📡 Serving on port {port}...")
+
+    local_ip = get_local_ip()
+    file_url = f"http://{local_ip}:{port}/{quote(file_name)}"
+    print(f"🔗 Streaming URL: {file_url}")
+
+    controller = DLNAController(desc.avtransport_control_url)
+    try:
+        title = os.path.splitext(file_name)[0]
+        print("🎬 Starting playback...")
+        controller.set_uri_with_metadata(0, file_url, title)
+        controller.play(0)
+        print("✅ Playback started successfully!")
+        print("💡 Press Ctrl+C to stop playback and exit")
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n⏹️  Stopping playback...")
+        try:
+            controller.stop(0)
+            print("✅ Playback stopped")
+        except Exception:
+            pass
+    finally:
+        print("🔄 Shutting down server...")
+        httpd.shutdown()
+        httpd.server_close()
+        print("✅ Server stopped")
+
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="DLNA/UPnP simple streamer")
+    sub = parser.add_subparsers(dest="command")
+
+    p_disc = sub.add_parser("discover", help="Discover DLNA/UPnP devices (unique, with AVTransport)")
+    p_disc.add_argument("--timeout", type=float, default=2.0)
+    p_disc.add_argument("--verbose", action="store_true")
+    p_disc.set_defaults(func=cmd_discover)
+
+    p_play = sub.add_parser("play", help="Play a local file on a selected device")
+    p_play.add_argument("file", help="Path to media file")
+    p_play.add_argument("--device-index", type=int, default=None, help="Index from discover list")
+    p_play.add_argument("--timeout", type=float, default=2.0)
+    # Default -1 means auto; we convert to 0 internally for ephemeral
+    p_play.add_argument("--port", type=int, default=-1)
+    p_play.add_argument("--verbose", action="store_true")
+    p_play.set_defaults(func=cmd_play)
+
+    args = parser.parse_args()
+    if not hasattr(args, "func"):
+        parser.print_help()
+        return 1
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

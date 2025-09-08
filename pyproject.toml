@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dlna-streamer"
+version = "1.0.0"
+description = "A professional Python DLNA/UPnP media streaming application"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+    {name = "Sebastian Yde Madsen", email = "your-email@example.com"}
+]
+maintainers = [
+    {name = "Sebastian Yde Madsen", email = "your-email@example.com"}
+]
+keywords = ["dlna", "upnp", "streaming", "media", "tv", "samsung"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Multimedia :: Video",
+    "Topic :: System :: Networking",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "requests>=2.31.0",
+    "urllib3>=2.0.0",
+    "click>=8.1.7",
+    "xmltodict>=0.13.0",
+    "defusedxml>=0.7.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=22.0",
+    "flake8>=5.0",
+    "mypy>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/dlna-streamer"
+Repository = "https://github.com/yourusername/dlna-streamer"
+Issues = "https://github.com/yourusername/dlna-streamer/issues"
+
+[project.scripts]
+dlna-stream = "dlna_streamer.cli:main"
+dlna-gui = "dlna_streamer.gui:launch"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["dlna_streamer*"]
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
