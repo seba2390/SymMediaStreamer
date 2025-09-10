@@ -290,3 +290,76 @@ def suggest_optimization_command(file_path: str) -> Optional[str]:
     ]
 
     return " ".join(cmd_parts)
+
+
+def build_optimization_command(
+    file_path: str,
+    *,
+    target_bitrate_mbps: float = 18.0,
+    force_mp4: bool = False,
+    remux_only: bool = False,
+) -> Tuple[Optional[list], Optional[str]]:
+    """Build an ffmpeg command to optimize a file for DLNA.
+
+    Returns a tuple of (command, mode), where mode is one of:
+    - "remux": stream copy to MP4 with faststart (video copy, audio -> AAC)
+    - "transcode": re-encode to H.264 + AAC with bitrate cap
+    - (None, None) if no optimization recommended
+
+    This does not execute the command.
+    """
+    container, codec, bitrate = detect_format_info(file_path)
+
+    # If already optimal MP4/H.264 and within bitrate cap, skip
+    if not force_mp4 and container == "mp4" and (codec in {"h264", "avc1"} or codec is None):
+        if bitrate is None or bitrate <= int(target_bitrate_mbps * 1000):
+            return None, None
+
+    output_path = os.path.splitext(file_path)[0] + "_optimized.mp4"
+
+    if remux_only and (codec in {"h264", "avc1", None}):
+        # Fast remux (copy video), convert audio to AAC for compatibility
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            file_path,
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            output_path,
+        ]
+        return cmd, "remux"
+
+    # Full transcode to H.264 + AAC with bitrate cap
+    maxrate_k = int(target_bitrate_mbps * 1000)
+    bufsize_k = maxrate_k * 2
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        file_path,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "23",
+        "-maxrate",
+        f"{maxrate_k}k",
+        "-bufsize",
+        f"{bufsize_k}k",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        output_path,
+    ]
+    return cmd, "transcode"

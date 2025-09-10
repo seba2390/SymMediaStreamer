@@ -67,6 +67,40 @@ The GUI provides:
 - Volume and mute controls
 - Streaming optimization analysis
 
+## Advanced Settings
+
+The GUI exposes an Advanced… dialog (Devices panel) to tune discovery and streaming behavior. These map to the CLI flags shown below.
+
+- Discovery timeout (seconds) [CLI: `--timeout`]
+  - Start with 2–3 seconds on stable home networks.
+  - Increase to 5–8 seconds if some TVs don’t appear on first refresh or on busy/mesh Wi‑Fi.
+  - Decrease to 1–2 seconds if you want faster refreshes and your device list is consistent.
+
+- HTTP server port (0 = auto) [CLI: `--port`]
+  - Use `0` (auto/ephemeral) by default to avoid conflicts.
+  - Pick a fixed high port (e.g., 8080, 8888, 18080) if your TV caches URLs or reconnects often; fixed ports can improve stability on some renderers.
+  - Avoid ports already used by other apps. If a fixed port fails, switch back to auto or choose another high port.
+
+- Optimize before play [Modes: off | ask | auto]
+  - off: never optimize; stream the selected file as-is.
+  - ask: if the file exceeds the target bitrate or is not MP4/H.264/AAC, you’ll be prompted to optimize.
+  - auto: automatically optimize before streaming when recommended.
+
+- Target video bitrate (Mbps)
+  - Recommended: 15–20 Mbps for typical Wi‑Fi. Use higher for Ethernet.
+  - Used as `-maxrate` (and `-bufsize` = 2×) for ffmpeg when transcoding.
+
+- Optimization strategy
+  - smart: prefer fast remux to MP4 when video is already H.264; otherwise transcode to H.264/AAC.
+  - remux: copy video stream to MP4 and convert audio to AAC with `+faststart` (no re-encode of video).
+  - transcode: re-encode video to H.264 with the target bitrate cap and audio to AAC.
+
+### Optimize file (manual)
+
+The Controls panel includes an “Optimize file…” button. It will propose an ffmpeg command (remux or transcode) based on your settings and run it with a progress indicator, producing a new `<name>_optimized.mp4` file.
+
+Requirements: `ffmpeg` must be installed and available on your PATH.
+
 ## Command Reference
 
 ### `discover` Command

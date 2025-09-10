@@ -6,7 +6,12 @@ from urllib.parse import quote
 
 from .avtransport import DLNAController
 from .device import fetch_description
-from .format_detector import get_streaming_recommendations, get_subtitle_info, suggest_optimization_command
+from .format_detector import (
+    build_optimization_command,
+    get_streaming_recommendations,
+    get_subtitle_info,
+    suggest_optimization_command,
+)
 from .http_server import serve_directory
 from .rendering_control import RenderingControl
 from .ssdp import discover
@@ -124,6 +129,7 @@ class PlaybackSession:
         rendering_control_url: str | None,
         subtitle_file: str = None,
         subtitle_track: int = None,
+        http_port: int = 0,
     ):
         if self.active:
             self.stop()
@@ -132,7 +138,8 @@ class PlaybackSession:
         self.current_file = file_name
         self.subtitle_file = subtitle_file
         self.subtitle_track = subtitle_track
-        self.httpd, port = serve_directory(serve_dir, port=0)
+        # Use specified port (0 means ephemeral)
+        self.httpd, port = serve_directory(serve_dir, port=http_port if http_port > 0 else 0)
         self.http_thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.http_thread.start()
         local_ip = _get_local_ip()
@@ -272,14 +279,30 @@ class DLNAGUI(tk.Tk):
         self.lst_devices = tk.Listbox(frm_devices, height=6, exportselection=False, selectmode=tk.BROWSE)
         self.lst_devices.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 4), pady=8)
         self.lst_devices.bind("<Double-Button-1>", self.on_device_double_click)
-        self.btn_refresh = tk.Button(frm_devices, text="Refresh", command=self.refresh_devices)
-        self.btn_refresh.pack(side=tk.RIGHT, padx=8, pady=8)
-        # Indeterminate progress bar for discovery
-        self.pb_refresh = ttk.Progressbar(frm_devices, mode="indeterminate", length=120)
-        # Pack to the right of the list, left of the button
-        self.pb_refresh.pack(side=tk.RIGHT, padx=8)
+        # Right-side vertical controls (progress, refresh, advanced)
+        right_controls = tk.Frame(frm_devices)
+        right_controls.pack(side=tk.RIGHT, padx=8, pady=8, fill=tk.Y)
+        self.btn_refresh = tk.Button(right_controls, text="Refresh", command=self.refresh_devices)
+        # Indeterminate progress bar for discovery (shown/hidden dynamically)
+        self.pb_refresh = ttk.Progressbar(right_controls, mode="indeterminate", length=120)
         self.pb_refresh.stop()
         self.pb_refresh.pack_forget()
+
+        # Advanced settings defaults
+        self.discovery_timeout = tk.DoubleVar(value=2.0)
+        self.http_port = tk.IntVar(value=0)  # 0 = auto
+        # Optimization settings
+        self.optimize_mode = tk.StringVar(value="ask")  # off|ask|auto
+        self.optimize_target_mbps = tk.DoubleVar(value=18.0)
+        self.optimize_strategy = tk.StringVar(value="smart")  # smart|remux|transcode
+
+        # Advanced settings button
+        self.btn_advanced = tk.Button(right_controls, text="Advanced…", command=self.open_advanced_settings)
+
+        # Pack in vertical order: progress (when visible), Refresh, Advanced
+        self.btn_refresh.pack(side=tk.TOP, anchor="e", pady=(0, 6))
+        self.btn_advanced.pack(side=tk.TOP, anchor="e")
+        # Note: progress bar is packed dynamically in refresh_devices into right_controls
         self.lbl_device = tk.Label(self, text="Selected device: None")
         self.lbl_device.pack(anchor="w", padx=12)
 
@@ -305,6 +328,15 @@ class DLNAGUI(tk.Tk):
         self.btn_pause.pack(side=tk.LEFT, padx=4)
         self.btn_resume = tk.Button(frm_controls, text="Resume", command=self.resume_playback)
         self.btn_resume.pack(side=tk.LEFT, padx=4)
+
+        # Optimize dropdown
+        self.mb_optimize = tk.Menubutton(frm_controls, text="Optimize…", relief=tk.RAISED, direction="below")
+        self.opt_menu = tk.Menu(self.mb_optimize, tearoff=0)
+        self.opt_menu.add_command(label="Analyze & Suggest", command=self.optimize_selected_file)
+        self.opt_menu.add_command(label="Remux to MP4 (fast)", command=self.optimize_selected_remux)
+        self.opt_menu.add_command(label="Transcode to MP4 (H.264/AAC)", command=self.optimize_selected_transcode)
+        self.mb_optimize.config(menu=self.opt_menu)
+        self.mb_optimize.pack(side=tk.LEFT, padx=12)
 
         # Seek controls
         frm_seek = tk.Frame(frm_controls)
@@ -509,7 +541,9 @@ class DLNAGUI(tk.Tk):
         # Disable button and show progress bar
         self.btn_refresh.config(state=tk.DISABLED)
         try:
-            self.pb_refresh.pack(side=tk.RIGHT, padx=8)
+            # Show spinner just above the Refresh button inside right_controls
+            self.pb_refresh.pack_forget()
+            self.pb_refresh.pack(side=tk.TOP, anchor="e", pady=(0, 6))
             self.pb_refresh.start(80)
         except Exception:
             pass
@@ -518,7 +552,7 @@ class DLNAGUI(tk.Tk):
 
         def do_discover():
             try:
-                found = get_avtransport_candidates(timeout=2.5)
+                found = get_avtransport_candidates(timeout=float(self.discovery_timeout.get()))
             except Exception:
                 found = []
 
@@ -649,17 +683,186 @@ class DLNAGUI(tk.Tk):
             pass  # Continue if analysis fails
 
         try:
+            # Optional pre-play optimization
+            media_to_play = media_path
+            if self.optimize_mode.get() != "off":
+                cmd, mode = self._maybe_build_optimize_cmd(media_path)
+                if cmd and mode:
+                    if self.optimize_mode.get() == "ask":
+                        if messagebox.askyesno(
+                            "Optimize file", f"Optimize before streaming?\nMode: {mode}\n\nThis may take time."
+                        ):
+                            optimized = self._run_ffmpeg(cmd)
+                            if optimized:
+                                media_to_play = optimized
+                    elif self.optimize_mode.get() == "auto":
+                        optimized = self._run_ffmpeg(cmd)
+                        if optimized:
+                            media_to_play = optimized
+
             # Get selected subtitle options
             subtitle_file = self.selected_subtitle_file
             subtitle_track = self._get_selected_subtitle_track()
 
             self.session.start(
-                desc.avtransport_control_url, media_path, desc.rendering_control_url, subtitle_file, subtitle_track
+                desc.avtransport_control_url,
+                media_to_play,
+                desc.rendering_control_url,
+                subtitle_file,
+                subtitle_track,
+                http_port=int(self.http_port.get()),
             )
             # Sync volume slider to TV's current setting after a short delay
             self.after(1000, self._sync_volume)
         except Exception as e:
             messagebox.showerror("Playback error", str(e))
+
+    def _maybe_build_optimize_cmd(self, file_path: str):
+        strategy = self.optimize_strategy.get()
+        remux_only = strategy == "remux"
+        force_mp4 = strategy in {"remux", "transcode"}
+        if strategy == "smart":
+            # Prefer remux if already H.264, else transcode
+            remux_only = True
+            force_mp4 = False
+        try:
+            cmd, mode = build_optimization_command(
+                file_path,
+                target_bitrate_mbps=float(self.optimize_target_mbps.get()),
+                force_mp4=force_mp4,
+                remux_only=remux_only,
+            )
+            return cmd, mode
+        except Exception:
+            return None, None
+
+    def _run_ffmpeg(self, command) -> str | None:
+        import shutil
+        import subprocess
+
+        # Normalize to list form
+        if isinstance(command, str):
+            cmd_list = command.split()
+        else:
+            cmd_list = list(command)
+        # Extract output path (last token)
+        output_path = cmd_list[-1] if cmd_list else None
+
+        # Check ffmpeg availability
+        if not shutil.which("ffmpeg"):
+            messagebox.showerror("ffmpeg not found", "Please install ffmpeg and ensure it is on your PATH.")
+            return None
+        win = tk.Toplevel(self)
+        win.title("Optimizing…")
+        win.transient(self)
+        win.grab_set()
+        ttk.Label(win, text="Running ffmpeg optimization. This may take a while.").pack(padx=12, pady=8)
+        pb = ttk.Progressbar(win, mode="indeterminate", length=300)
+        pb.pack(padx=12, pady=(0, 8))
+        pb.start(100)
+        cancelled = {"value": False}
+
+        def on_cancel():
+            cancelled["value"] = True
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+        btn = ttk.Button(win, text="Cancel", command=on_cancel)
+        btn.pack(pady=(0, 8))
+
+        def runner():
+            try:
+                proc = subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                out, err = proc.communicate()
+                code = proc.returncode
+            except Exception:
+                code = -1
+
+            def finish():
+                try:
+                    pb.stop()
+                    win.destroy()
+                except Exception:
+                    pass
+                if code == 0 and output_path and os.path.isfile(output_path) and not cancelled["value"]:
+                    messagebox.showinfo("Optimization complete", f"Created: {os.path.basename(output_path)}")
+                elif cancelled["value"]:
+                    messagebox.showwarning("Optimization cancelled", "Operation was cancelled.")
+                else:
+                    try:
+                        err_text = (
+                            err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
+                        )
+                    except Exception:
+                        err_text = ""
+                    messagebox.showerror("Optimization failed", f"ffmpeg failed.\n\n{err_text[-800:]}")
+
+            self.after(0, finish)
+
+        threading.Thread(target=runner, daemon=True).start()
+        self.wait_window(win)
+        return output_path if output_path and os.path.isfile(output_path) else None
+
+    def optimize_selected_file(self):
+        if not self.files:
+            messagebox.showerror("No file", "Please add at least one file.")
+            return
+        idx = self.selected_file_idx or 0
+        file_path = self.files[idx]
+        cmd, mode = self._maybe_build_optimize_cmd(file_path)
+        if not cmd or not mode:
+            messagebox.showinfo("Optimize file", "File already appears optimal for DLNA streaming.")
+            return
+        if messagebox.askyesno("Optimize file", f"Proceed with {mode} optimization?\nThis may take time."):
+            self._run_ffmpeg(cmd)
+
+    def optimize_selected_remux(self):
+        if not self.files:
+            messagebox.showerror("No file", "Please add at least one file.")
+            return
+        idx = self.selected_file_idx or 0
+        file_path = self.files[idx]
+        # Force remux
+        try:
+            cmd, mode = build_optimization_command(
+                file_path,
+                target_bitrate_mbps=float(self.optimize_target_mbps.get()),
+                force_mp4=True,
+                remux_only=True,
+            )
+        except Exception:
+            cmd, mode = None, None
+        if not cmd or not mode:
+            messagebox.showinfo("Remux", "File already appears suitable for fast remux or not applicable.")
+            return
+        if messagebox.askyesno("Remux to MP4", "Proceed with fast remux to MP4? This is usually quick."):
+            self._run_ffmpeg(cmd)
+
+    def optimize_selected_transcode(self):
+        if not self.files:
+            messagebox.showerror("No file", "Please add at least one file.")
+            return
+        idx = self.selected_file_idx or 0
+        file_path = self.files[idx]
+        # Force transcode
+        try:
+            cmd, mode = build_optimization_command(
+                file_path,
+                target_bitrate_mbps=float(self.optimize_target_mbps.get()),
+                force_mp4=True,
+                remux_only=False,
+            )
+        except Exception:
+            cmd, mode = None, None
+        if not cmd:
+            messagebox.showinfo("Transcode", "No transcode needed based on current settings.")
+            return
+        if messagebox.askyesno(
+            "Transcode to MP4", "Proceed with H.264/AAC transcode with bitrate cap? This may take time."
+        ):
+            self._run_ffmpeg(cmd)
 
     def _sync_volume(self):
         """Sync volume slider and mute checkbox to TV's current state."""
@@ -707,6 +910,66 @@ class DLNAGUI(tk.Tk):
                 self.session.render_ctrl.set_mute(0, "Master", desired)
             except Exception:
                 pass
+
+    def open_advanced_settings(self):
+        """Open a simple dialog for advanced settings."""
+        win = tk.Toplevel(self)
+        win.title("Advanced Settings")
+        win.transient(self)
+        win.grab_set()
+        win.resizable(False, False)
+
+        pad = {"padx": 10, "pady": 6}
+
+        # Discovery timeout
+        ttk.Label(win, text="Discovery timeout (seconds):").grid(row=0, column=0, sticky="w", **pad)
+        sp_timeout = ttk.Spinbox(win, from_=1.0, to=15.0, increment=0.5, textvariable=self.discovery_timeout, width=6)
+        sp_timeout.grid(row=0, column=1, sticky="w", **pad)
+
+        # HTTP port
+        ttk.Label(win, text="HTTP server port (0 = auto):").grid(row=1, column=0, sticky="w", **pad)
+        sp_port = ttk.Spinbox(win, from_=0, to=65535, increment=1, textvariable=self.http_port, width=8)
+        sp_port.grid(row=1, column=1, sticky="w", **pad)
+
+        # Optimization mode
+        ttk.Label(win, text="Optimize before play:").grid(row=2, column=0, sticky="w", **pad)
+        cb_mode = ttk.Combobox(
+            win, state="readonly", values=["off", "ask", "auto"], textvariable=self.optimize_mode, width=8
+        )
+        cb_mode.grid(row=2, column=1, sticky="w", **pad)
+
+        # Target bitrate
+        ttk.Label(win, text="Target video bitrate (Mbps):").grid(row=3, column=0, sticky="w", **pad)
+        sp_br = ttk.Spinbox(win, from_=5.0, to=50.0, increment=1.0, textvariable=self.optimize_target_mbps, width=8)
+        sp_br.grid(row=3, column=1, sticky="w", **pad)
+
+        # Strategy
+        ttk.Label(win, text="Optimization strategy:").grid(row=4, column=0, sticky="w", **pad)
+        cb_strat = ttk.Combobox(
+            win, state="readonly", values=["smart", "remux", "transcode"], textvariable=self.optimize_strategy, width=12
+        )
+        cb_strat.grid(row=4, column=1, sticky="w", **pad)
+
+        # Buttons
+        btns = tk.Frame(win)
+        btns.grid(row=5, column=0, columnspan=2, sticky="e", **pad)
+
+        def on_close():
+            try:
+                # Clamp values
+                self.discovery_timeout.set(max(1.0, min(15.0, float(self.discovery_timeout.get()))))
+                port = int(self.http_port.get())
+                if port < 0 or port > 65535:
+                    self.http_port.set(0)
+                self.optimize_target_mbps.set(max(5.0, min(50.0, float(self.optimize_target_mbps.get()))))
+            except Exception:
+                self.discovery_timeout.set(2.0)
+                self.http_port.set(0)
+                self.optimize_target_mbps.set(18.0)
+            win.destroy()
+
+        ttk.Button(btns, text="OK", command=on_close).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.RIGHT)
 
 
 def launch():
