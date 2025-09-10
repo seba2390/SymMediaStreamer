@@ -695,10 +695,13 @@ class DLNAGUI(tk.Tk):
                             optimized = self._run_ffmpeg(cmd)
                             if optimized:
                                 media_to_play = optimized
+                                # Replace selected file in list with optimized one
+                                self._replace_selected_file(idx_file, optimized)
                     elif self.optimize_mode.get() == "auto":
                         optimized = self._run_ffmpeg(cmd)
                         if optimized:
                             media_to_play = optimized
+                            self._replace_selected_file(idx_file, optimized)
 
             # Get selected subtitle options
             subtitle_file = self.selected_subtitle_file
@@ -816,7 +819,9 @@ class DLNAGUI(tk.Tk):
             messagebox.showinfo("Optimize file", "File already appears optimal for DLNA streaming.")
             return
         if messagebox.askyesno("Optimize file", f"Proceed with {mode} optimization?\nThis may take time."):
-            self._run_ffmpeg(cmd)
+            out = self._run_ffmpeg(cmd)
+            if out:
+                self._replace_selected_file(idx, out)
 
     def optimize_selected_remux(self):
         if not self.files:
@@ -838,7 +843,9 @@ class DLNAGUI(tk.Tk):
             messagebox.showinfo("Remux", "File already appears suitable for fast remux or not applicable.")
             return
         if messagebox.askyesno("Remux to MP4", "Proceed with fast remux to MP4? This is usually quick."):
-            self._run_ffmpeg(cmd)
+            out = self._run_ffmpeg(cmd)
+            if out:
+                self._replace_selected_file(idx, out)
 
     def optimize_selected_transcode(self):
         if not self.files:
@@ -862,7 +869,28 @@ class DLNAGUI(tk.Tk):
         if messagebox.askyesno(
             "Transcode to MP4", "Proceed with H.264/AAC transcode with bitrate cap? This may take time."
         ):
-            self._run_ffmpeg(cmd)
+            out = self._run_ffmpeg(cmd)
+            if out:
+                self._replace_selected_file(idx, out)
+
+    def _replace_selected_file(self, idx: int, new_path: str):
+        """Replace the file at idx with new_path and refresh UI selections/info."""
+        try:
+            self.files[idx] = new_path
+            # Update listbox entry
+            self.lst_files.delete(idx)
+            self.lst_files.insert(idx, new_path)
+            # Keep selection on the new item
+            self.lst_files.selection_clear(0, tk.END)
+            self.lst_files.selection_set(idx)
+            self.lst_files.activate(idx)
+            self.selected_file_idx = idx
+            self.lbl_file.config(text=f"Selected file: {os.path.basename(new_path)}")
+            # Refresh optimization and subtitle info for new file
+            self._update_optimization_info(new_path)
+            self._update_subtitle_info(new_path)
+        except Exception:
+            pass
 
     def _sync_volume(self):
         """Sync volume slider and mute checkbox to TV's current state."""
