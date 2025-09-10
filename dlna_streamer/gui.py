@@ -149,7 +149,10 @@ class PlaybackSession:
                 if subtitle_track is not None:
                     print(f"📝 Embedded subtitle track: {subtitle_track}")
                 title = os.path.splitext(file_name)[0]
-                self.controller.set_uri_with_metadata(0, file_url, title)
+                # Pass local file path to enable codec-aware DLNA profiles
+                self.controller.set_uri_with_metadata(
+                    0, file_url, title, local_file_path=os.path.join(serve_dir, file_name)
+                )
                 self.controller.play(0)
                 self.active = True
                 self.paused = False
@@ -269,8 +272,14 @@ class DLNAGUI(tk.Tk):
         self.lst_devices = tk.Listbox(frm_devices, height=6, exportselection=False, selectmode=tk.BROWSE)
         self.lst_devices.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 4), pady=8)
         self.lst_devices.bind("<Double-Button-1>", self.on_device_double_click)
-        btn_refresh = tk.Button(frm_devices, text="Refresh", command=self.refresh_devices)
-        btn_refresh.pack(side=tk.RIGHT, padx=8, pady=8)
+        self.btn_refresh = tk.Button(frm_devices, text="Refresh", command=self.refresh_devices)
+        self.btn_refresh.pack(side=tk.RIGHT, padx=8, pady=8)
+        # Indeterminate progress bar for discovery
+        self.pb_refresh = ttk.Progressbar(frm_devices, mode="indeterminate", length=120)
+        # Pack to the right of the list, left of the button
+        self.pb_refresh.pack(side=tk.RIGHT, padx=8)
+        self.pb_refresh.stop()
+        self.pb_refresh.pack_forget()
         self.lbl_device = tk.Label(self, text="Selected device: None")
         self.lbl_device.pack(anchor="w", padx=12)
 
@@ -497,27 +506,56 @@ class DLNAGUI(tk.Tk):
             return None
 
     def refresh_devices(self):
+        # Disable button and show progress bar
+        self.btn_refresh.config(state=tk.DISABLED)
+        try:
+            self.pb_refresh.pack(side=tk.RIGHT, padx=8)
+            self.pb_refresh.start(80)
+        except Exception:
+            pass
+
         prev_uuid = self.selected_device_uuid
-        self.lst_devices.delete(0, tk.END)
-        self.devices = get_avtransport_candidates(timeout=2.0)
-        self.selected_device_idx = None
-        self.selected_device_uuid = None
-        if not self.devices:
-            self.lst_devices.insert(tk.END, "No devices found")
-            self.lbl_device.config(text="Selected device: None")
-            return
-        for i, (dev, desc) in enumerate(self.devices):
-            self.lst_devices.insert(tk.END, desc.friendly_name)
-            if prev_uuid and _root_uuid(dev.usn) == prev_uuid:
-                self.lst_devices.selection_set(i)
-                self.lst_devices.activate(i)
-                self.selected_device_idx = i
-                self.selected_device_uuid = prev_uuid
-        if self.selected_device_idx is None:
-            self.lbl_device.config(text="Selected device: None")
-        else:
-            _, desc = self.devices[self.selected_device_idx]
-            self.lbl_device.config(text=f"Selected device: {desc.friendly_name}")
+
+        def do_discover():
+            try:
+                found = get_avtransport_candidates(timeout=2.5)
+            except Exception:
+                found = []
+
+            def on_done():
+                # Update UI with results
+                self.lst_devices.delete(0, tk.END)
+                self.devices = found
+                self.selected_device_idx = None
+                self.selected_device_uuid = None
+                if not self.devices:
+                    self.lst_devices.insert(tk.END, "No devices found")
+                    self.lbl_device.config(text="Selected device: None")
+                else:
+                    for i, (dev, desc) in enumerate(self.devices):
+                        self.lst_devices.insert(tk.END, desc.friendly_name)
+                        if prev_uuid and _root_uuid(dev.usn) == prev_uuid:
+                            self.lst_devices.selection_set(i)
+                            self.lst_devices.activate(i)
+                            self.selected_device_idx = i
+                            self.selected_device_uuid = prev_uuid
+                    if self.selected_device_idx is None:
+                        self.lbl_device.config(text="Selected device: None")
+                    else:
+                        _, desc = self.devices[self.selected_device_idx]
+                        self.lbl_device.config(text=f"Selected device: {desc.friendly_name}")
+
+                # Hide progress bar and re-enable button
+                try:
+                    self.pb_refresh.stop()
+                    self.pb_refresh.pack_forget()
+                except Exception:
+                    pass
+                self.btn_refresh.config(state=tk.NORMAL)
+
+            self.after(0, on_done)
+
+        threading.Thread(target=do_discover, daemon=True).start()
 
     def on_device_double_click(self, event):
         sel = self.lst_devices.curselection()

@@ -111,7 +111,10 @@ bin/dlna_stream play "/Users/username/Movies/movie.mp4" --port 8080
 - **64KB streaming buffers** (vs standard 8KB)
 - **TCP_NODELAY** for reduced latency
 - **256KB socket buffers** for improved throughput
-- **HTTP keep-alive** connections
+- **HTTP/1.1 keep-alive** connections
+- **Threaded HTTP server** to handle concurrent range requests
+- **Bounded Range responses** strictly honoring `Content-Range`
+- **Zero-copy sendfile** path on supported platforms (macOS/Linux)
 
 ### DLNA Protocol
 - **Format-specific profiles** for optimal TV compatibility
@@ -121,6 +124,7 @@ bin/dlna_stream play "/Users/username/Movies/movie.mp4" --port 8080
 
 ### Media Analysis
 - **Automatic format detection** using ffprobe (when available)
+- **Codec-aware DLNA profiles** in metadata (uses detected container/codec)
 - **Codec compatibility analysis** with optimization suggestions
 - **Bitrate recommendations** for network conditions
 - **Subtitle track detection** and metadata extraction

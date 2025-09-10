@@ -166,7 +166,7 @@ def cmd_play(args):
     try:
         title = os.path.splitext(file_name)[0]
         print("🎬 Starting playback...")
-        controller.set_uri_with_metadata(0, file_url, title)
+        controller.set_uri_with_metadata(0, file_url, title, local_file_path=media_path)
         controller.play(0)
         print("✅ Playback started successfully!")
         print("💡 Press Ctrl+C to stop playback and exit")

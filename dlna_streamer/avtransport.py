@@ -2,6 +2,12 @@ import http.client
 import mimetypes
 import urllib.parse
 
+try:
+    # Optional: used to refine DLNA profile selection
+    from dlna_streamer.format_detector import detect_format_info
+except Exception:  # pragma: no cover - best-effort import
+    detect_format_info = None
+
 AVTRANSPORT_SERVICE_TYPE = "urn:schemas-upnp-org:service:AVTransport:1"
 AVTRANSPORT_CONTROL_NS = "urn:schemas-upnp-org:service:AVTransport:1"
 SOAP_ENV = "http://schemas.xmlsoap.org/soap/envelope/"
@@ -18,25 +24,39 @@ def _escape_xml(text: str) -> str:
     )
 
 
-def _get_dlna_profile(mime_type: str) -> str:
-    """Return appropriate DLNA profile based on MIME type for better TV compatibility."""
-    if mime_type == "video/mp4":
-        return (
-            "DLNA.ORG_PN=AVC_MP4_HD_24_AC3;DLNA.ORG_OP=11;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"
-        )
-    elif mime_type == "video/x-matroska":
-        return (
-            "DLNA.ORG_PN=AVC_MKV_HD_24_AC3;DLNA.ORG_OP=11;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"
-        )
-    elif mime_type.startswith("video/"):
-        return "DLNA.ORG_OP=11;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"
-    elif mime_type.startswith("audio/"):
+def _get_dlna_profile(mime_type: str, container: str | None = None, codec: str | None = None) -> str:
+    """Return a conservative DLNA profile string.
+
+    We prefer to include a DLNA.ORG_PN only when we are reasonably confident.
+    Otherwise, we fall back to generic flags allowing seek/pause.
+    """
+    codec = (codec or "").lower()
+    container = (container or "").lower()
+
+    # H.264 in MP4/MOV – most widely compatible
+    if mime_type == "video/mp4" or container in {"mp4", "mov"}:
+        if codec in {"h264", "avc1"}:
+            return "DLNA.ORG_PN=AVC_MP4_HD_24_AC3;DLNA.ORG_OP=11;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"
+        if codec in {"hevc", "h265"}:
+            return "DLNA.ORG_PN=HEVC_MP4_MAIN10;DLNA.ORG_OP=11;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"
+
+    # Matroska with H.264/HEVC – many TVs accept but some do not
+    if mime_type == "video/x-matroska" or container == "matroska":
+        if codec in {"h264", "avc1"}:
+            return "DLNA.ORG_PN=AVC_MKV_HD_24_AC3;DLNA.ORG_OP=11;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"
+        if codec in {"hevc", "h265"}:
+            return "DLNA.ORG_PN=HEVC_MKV_MAIN10;DLNA.ORG_OP=11;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"
+
+    if mime_type.startswith("audio/"):
         return "DLNA.ORG_PN=MP3;DLNA.ORG_OP=11;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"
-    else:
-        return "DLNA.ORG_OP=11;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"
+
+    # Generic fallback with operations enabled
+    return "DLNA.ORG_OP=11;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"
 
 
-def build_didl_lite_metadata(content_url: str, title: str, mime_type: str) -> str:
+def build_didl_lite_metadata(
+    content_url: str, title: str, mime_type: str, *, container: str | None = None, codec: str | None = None
+) -> str:
     """Return a minimal DIDL-Lite item metadata string for the media resource.
 
     Includes DLNA parameters in protocolInfo to indicate support for operations
@@ -51,7 +71,7 @@ def build_didl_lite_metadata(content_url: str, title: str, mime_type: str) -> st
         upnp_class = "object.item"
 
     # Use format-specific DLNA profile for better TV compatibility
-    dlna_params = _get_dlna_profile(mime_type)
+    dlna_params = _get_dlna_profile(mime_type, container=container, codec=codec)
     protocol_info = f"http-get:*:{mime_type}:{dlna_params}"
 
     esc_title = _escape_xml(title)
@@ -117,10 +137,23 @@ class DLNAController:
         </u:SetAVTransportURI>'''
         return self._post_soap("SetAVTransportURI", body)
 
-    def set_uri_with_metadata(self, instance_id: int, content_url: str, title: str) -> None:
-        """Best-effort: try with minimal DIDL-Lite metadata first, fallback to bare URI."""
-        guessed = mimetypes.guess_type(content_url)[0] or "video/mp4"
-        didl = build_didl_lite_metadata(content_url, title, guessed)
+    def set_uri_with_metadata(
+        self, instance_id: int, content_url: str, title: str, *, local_file_path: str | None = None
+    ) -> None:
+        """Best-effort: include DIDL-Lite metadata with refined DLNA profile.
+
+        If local_file_path is provided and format detection is available, use it
+        to select a more specific DLNA profile. Fall back gracefully otherwise.
+        """
+        mime = mimetypes.guess_type(content_url)[0] or "video/mp4"
+        container = None
+        codec = None
+        if local_file_path and detect_format_info is not None:
+            try:
+                container, codec, _ = detect_format_info(local_file_path)
+            except Exception:
+                container, codec = None, None
+        didl = build_didl_lite_metadata(content_url, title, mime, container=container, codec=codec)
         try:
             self.set_av_transport_uri(instance_id, content_url, didl)
         except RuntimeError:
