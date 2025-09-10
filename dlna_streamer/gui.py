@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import quote
@@ -10,7 +11,6 @@ from .format_detector import (
     build_optimization_command,
     get_streaming_recommendations,
     get_subtitle_info,
-    suggest_optimization_command,
 )
 from .http_server import serve_directory
 from .rendering_control import RenderingControl
@@ -256,7 +256,7 @@ class DLNAGUI(tk.Tk):
         screen_height = self.winfo_screenheight()
 
         # Set window to full height with reasonable width
-        window_width = min(640, screen_width)
+        window_width = screen_width
         self.geometry(f"{window_width}x{screen_height}")
 
         # Center the window horizontally
@@ -352,7 +352,33 @@ class DLNAGUI(tk.Tk):
         frm_status = tk.LabelFrame(self, text="Status")
         frm_status.pack(fill=tk.X, padx=8, pady=8)
         self.lbl_progress = tk.Label(frm_status, text="00:00:00 / 00:00:00")
+        # Seek bar (position)
+        self._seek_user_drag = False
+        self._seek_total_secs = 0
+        self._seek_cooldown_deadline = 0.0
+        self._seek_last_secs = 0
+        self._seek_hold_target_secs = None  # hold user target briefly after seek
+        self._seek_hold_start = 0.0  # monotonic time when hold started
+        # Smooth display tracking
+        self._display_secs = 0
+        self._display_last_time = 0.0
+        self.seek_scale = tk.Scale(
+            frm_status,
+            from_=0,
+            to=0,
+            orient=tk.HORIZONTAL,
+            length=300,
+            showvalue=False,
+            command=lambda v: None,
+        )
+        # Pack seek scale across status row
+        self.seek_scale.pack(side=tk.LEFT, padx=12, fill=tk.X, expand=True)
+        # Pack time label to the right of the slider
         self.lbl_progress.pack(side=tk.LEFT, padx=8)
+        # Mouse bindings to manage drag lifecycle
+        self.seek_scale.bind("<ButtonPress-1>", self._on_seek_press)
+        self.seek_scale.bind("<ButtonRelease-1>", self._on_seek_release)
+        self.seek_scale.bind("<B1-Motion>", self._on_seek_motion)
         self.mute_var = tk.IntVar(value=0)
         self.chk_mute = tk.Checkbutton(frm_status, text="Mute", variable=self.mute_var, command=self.on_toggle_mute)
         self.chk_mute.pack(side=tk.RIGHT, padx=8)
@@ -418,14 +444,125 @@ class DLNAGUI(tk.Tk):
         if self.session.active and self.session.controller:
             try:
                 xml = self.session.controller.get_position_info(0)
-                rel = _parse_tag(xml, "RelTime")
-                dur = _parse_tag(xml, "TrackDuration") or _parse_tag(xml, "Duration")
-                self.lbl_progress.config(text=f"{_fmt_time(rel)} / {_fmt_time(dur)}")
+                rel_raw = _parse_tag(xml, "RelTime")
+                dur_raw = _parse_tag(xml, "TrackDuration") or _parse_tag(xml, "Duration")
+                rel_secs = _hhmmss_to_seconds(rel_raw)
+                dur_secs = _hhmmss_to_seconds(dur_raw)
+                # Update seek slider unless user is dragging
+                total_secs = dur_secs
+                cur_secs = rel_secs
+                # Only update if we have a valid duration
+                if total_secs > 0:
+                    # Ensure slider has correct max range
+                    if int(self.seek_scale.cget("to")) != total_secs:
+                        self.seek_scale.config(to=total_secs, state=tk.NORMAL)
+                    # Decide what value to show (desired_value), then smooth to it
+                    now = time.monotonic()
+                    desired_value = cur_secs
+                    if now < self._seek_cooldown_deadline and self._seek_hold_target_secs is not None:
+                        # During cooldown, advance locally from user-chosen target for smooth progression
+                        delta = max(0.0, now - self._seek_hold_start)
+                        predicted = int(self._seek_hold_target_secs + delta)
+                        desired_value = max(0, min(total_secs, predicted))
+                    else:
+                        # After cooldown: avoid snapping backwards due to transient device reports
+                        current_slider = (
+                            int(float(self.seek_scale.get()))
+                            if str(self.seek_scale.cget("state")) != str(tk.DISABLED)
+                            else 0
+                        )
+                        if time.monotonic() - getattr(self, "_last_seek_time", 0.0) > 6.0 and cur_secs < max(
+                            0, current_slider - 2
+                        ):
+                            # Ignore backward jump larger than 2s
+                            desired_value = current_slider
+                        else:
+                            desired_value = max(0, min(total_secs, cur_secs))
+                        # Clear hold target once cooldown ends
+                        self._seek_hold_target_secs = None
+                    # Smooth local display progression between device updates
+                    if self._display_last_time == 0.0:
+                        self._display_secs = desired_value
+                        self._display_last_time = now
+                    else:
+                        if not self._seek_user_drag:
+                            elapsed = max(0.0, now - self._display_last_time)
+                            # If device time hasn't advanced meaningfully, we advance locally
+                            if desired_value <= self._display_secs + 0.5 and not self.session.paused:
+                                self._display_secs = min(total_secs, self._display_secs + elapsed)
+                            else:
+                                # Re-sync towards desired_value but prevent backward snap >2s
+                                if desired_value < self._display_secs - 2:
+                                    desired_value = self._display_secs
+                                self._display_secs = desired_value
+                            self._display_last_time = now
+                    if not self._seek_user_drag:
+                        self.seek_scale.set(int(self._display_secs))
+                    self._seek_total_secs = total_secs
+                    self._seek_last_secs = int(self._display_secs)
+                    # Update time label using the display value for consistency
+                    self.lbl_progress.config(
+                        text=f"{_seconds_to_hhmmss(int(self._display_secs))} / {_seconds_to_hhmmss(total_secs)}"
+                    )
             except Exception:
                 pass
         else:
             self.lbl_progress.config(text="00:00:00 / 00:00:00")
-        self.after(1000, self._poll_status)
+            self.seek_scale.config(state=tk.DISABLED)
+            self._seek_total_secs = 0
+            self._seek_last_secs = 0
+            self._seek_hold_target_secs = None
+            self._seek_hold_start = 0.0
+            self._display_secs = 0
+            self._display_last_time = 0.0
+        # Faster refresh for smoother slider
+        self.after(500, self._poll_status)
+
+    def _on_seek_press(self, event):
+        # Mark that user is dragging; UI updates pause for the slider
+        self._seek_user_drag = True
+
+    def _on_seek_release(self, event):
+        # Apply seek to the position represented by the slider
+        try:
+            if self._seek_total_secs > 0 and self.session.active and self.session.controller:
+                target_secs = int(float(self.seek_scale.get()))
+                target_secs = max(0, min(self._seek_total_secs, target_secs))
+                hhmmss = _seconds_to_hhmmss(target_secs)
+                self.session.seek(hhmmss)
+                # Immediately reflect the chosen time in the UI to avoid snap-back feel
+                now = time.monotonic()
+                self._display_secs = target_secs
+                self._display_last_time = now
+                self.seek_scale.set(target_secs)
+                self.lbl_progress.config(
+                    text=f"{_seconds_to_hhmmss(int(self._display_secs))} / {_seconds_to_hhmmss(self._seek_total_secs)}"
+                )
+                # Start cooldown (~4s) to avoid slider snapping while device updates
+                self._seek_hold_target_secs = target_secs
+                self._seek_hold_start = time.monotonic()
+                self._seek_cooldown_deadline = self._seek_hold_start + 4.0
+                # Remember last seek wall clock time to allow backward seeks without ignore
+                try:
+                    self._last_seek_time = self._seek_hold_start
+                except Exception:
+                    self._last_seek_time = self._seek_hold_start
+        except Exception:
+            pass
+        finally:
+            self._seek_user_drag = False
+
+    def _on_seek_motion(self, event):
+        """Update the time label live while the user drags the slider."""
+        try:
+            self._seek_user_drag = True
+            val = int(float(self.seek_scale.get()))
+            total = max(self._seek_total_secs, int(float(self.seek_scale.cget("to")) or 0))
+            total = max(total, 0)
+            # Update label to reflect the position under the cursor
+            self.lbl_progress.config(text=f"{_seconds_to_hhmmss(val)} / {_seconds_to_hhmmss(total)}")
+        except Exception:
+            pass
 
     def _update_optimization_info(self, file_path: str):
         """Update optimization info display for selected file."""
@@ -670,42 +807,37 @@ class DLNAGUI(tk.Tk):
         _, desc = self.devices[idx_dev]
         media_path = self.files[idx_file]
 
-        # Check for optimization recommendations
-        try:
-            recommendations = get_streaming_recommendations(media_path)
-            if not recommendations["is_optimal"] and recommendations["suggestions"]:
-                opt_cmd = suggest_optimization_command(media_path)
-                if opt_cmd:
-                    msg = f"File may not stream optimally:\n\n{chr(10).join(recommendations['suggestions'])}\n\nOptimization command:\n{opt_cmd}\n\nContinue anyway?"
-                    if not messagebox.askyesno("Streaming Optimization", msg):
-                        return
-        except Exception:
-            pass  # Continue if analysis fails
+        # Suppress suggestion popup during play; rely on Advanced optimize settings instead
 
         try:
             # Optional pre-play optimization
             media_to_play = media_path
-            if self.optimize_mode.get() != "off":
+            if self.optimize_mode.get() == "auto":
                 cmd, mode = self._maybe_build_optimize_cmd(media_path)
                 if cmd and mode:
-                    if self.optimize_mode.get() == "ask":
-                        if messagebox.askyesno(
-                            "Optimize file", f"Optimize before streaming?\nMode: {mode}\n\nThis may take time."
-                        ):
-                            optimized = self._run_ffmpeg(cmd)
-                            if optimized:
-                                media_to_play = optimized
-                                # Replace selected file in list with optimized one
-                                self._replace_selected_file(idx_file, optimized)
-                    elif self.optimize_mode.get() == "auto":
-                        optimized = self._run_ffmpeg(cmd)
-                        if optimized:
-                            media_to_play = optimized
-                            self._replace_selected_file(idx_file, optimized)
+                    optimized = self._run_ffmpeg(cmd)
+                    if optimized:
+                        media_to_play = optimized
+                        self._replace_selected_file(idx_file, optimized)
 
             # Get selected subtitle options
             subtitle_file = self.selected_subtitle_file
             subtitle_track = self._get_selected_subtitle_track()
+
+            # Reset display/slider at (re)play start
+            self._display_secs = 0
+            self._display_last_time = 0.0
+            self._seek_hold_target_secs = None
+            self._seek_cooldown_deadline = 0.0
+            self._seek_last_secs = 0
+            self._last_seek_time = 0.0
+            # Move slider fully left and disable until duration is known
+            try:
+                self.seek_scale.config(state=tk.DISABLED, to=0)
+                self.seek_scale.set(0)
+                self.lbl_progress.config(text="00:00:00 / 00:00:00")
+            except Exception:
+                pass
 
             self.session.start(
                 desc.avtransport_control_url,
@@ -765,10 +897,14 @@ class DLNAGUI(tk.Tk):
         pb.start(100)
         cancelled = {"value": False}
 
+        proc_holder = {"p": None}
+
         def on_cancel():
             cancelled["value"] = True
             try:
-                proc.terminate()
+                p = proc_holder.get("p")
+                if p:
+                    p.terminate()
             except Exception:
                 pass
 
@@ -777,9 +913,9 @@ class DLNAGUI(tk.Tk):
 
         def runner():
             try:
-                proc = subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                out, err = proc.communicate()
-                code = proc.returncode
+                proc_holder["p"] = subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                out, err = proc_holder["p"].communicate()
+                code = proc_holder["p"].returncode
             except Exception:
                 code = -1
 
@@ -814,11 +950,11 @@ class DLNAGUI(tk.Tk):
             return
         idx = self.selected_file_idx or 0
         file_path = self.files[idx]
-        cmd, mode = self._maybe_build_optimize_cmd(file_path)
-        if not cmd or not mode:
+        cmd, _ = self._maybe_build_optimize_cmd(file_path)
+        if not cmd:
             messagebox.showinfo("Optimize file", "File already appears optimal for DLNA streaming.")
             return
-        if messagebox.askyesno("Optimize file", f"Proceed with {mode} optimization?\nThis may take time."):
+        if messagebox.askyesno("Optimize file", "Proceed with optimization? This may take time."):
             out = self._run_ffmpeg(cmd)
             if out:
                 self._replace_selected_file(idx, out)
@@ -855,14 +991,14 @@ class DLNAGUI(tk.Tk):
         file_path = self.files[idx]
         # Force transcode
         try:
-            cmd, mode = build_optimization_command(
+            cmd, _ = build_optimization_command(
                 file_path,
                 target_bitrate_mbps=float(self.optimize_target_mbps.get()),
                 force_mp4=True,
                 remux_only=False,
             )
         except Exception:
-            cmd, mode = None, None
+            cmd, _ = None, None
         if not cmd:
             messagebox.showinfo("Transcode", "No transcode needed based on current settings.")
             return
@@ -903,6 +1039,19 @@ class DLNAGUI(tk.Tk):
 
     def stop_playback(self):
         self.session.stop()
+        # Reset slider/time immediately on stop
+        try:
+            self.seek_scale.config(state=tk.DISABLED)
+            self.seek_scale.set(0)
+            self._seek_total_secs = 0
+            self._seek_last_secs = 0
+            self._seek_hold_target_secs = None
+            self._seek_hold_start = 0.0
+            self._display_secs = 0
+            self._display_last_time = 0.0
+            self.lbl_progress.config(text="00:00:00 / 00:00:00")
+        except Exception:
+            pass
 
     def pause_playback(self):
         try:
